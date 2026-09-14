@@ -27,20 +27,26 @@ generate_volume_mounts() {
   local work_dir=$1
   local claudeignore="$work_dir/.claudeignore"
 
-  # If fd is available, use it to enumerate non-ignored items
-  if command -v fd &> /dev/null; then
-    # Use fd to get all non-ignored items, then compute minimal mount set with Python
-    fd --ignore-file "$claudeignore" . "$work_dir" 2>/dev/null | python3 << 'PYTHON_SCRIPT'
+  # If fdfind is available, use it to enumerate non-ignored items
+  if command -v fdfind &> /dev/null; then
+    # Use fdfind to get all non-ignored items, then compute minimal mount set with Python
+    fdfind --ignore-file "$claudeignore" . "$work_dir" 2>/dev/null | python3 -c '
 import sys
-import os
 from pathlib import Path
+
+work_dir = Path(sys.argv[1]).resolve()
 
 # Read paths from stdin (relative to work_dir)
 paths = set()
 for line in sys.stdin:
     path = line.strip()
     if path and path != ".":
-        paths.add(path)
+        try:
+          ppath = Path(path)
+          ppath = ppath.resolve().relative_to(work_dir)
+          paths.add(ppath)
+        except ValueError:
+          pass
 
 if not paths:
     sys.exit(0)
@@ -51,55 +57,19 @@ sorted_paths = sorted(paths)
 
 for path in sorted_paths:
     # Check if this path is a child of any already-included path
-    is_child = False
-    for included in minimal:
-        if path.startswith(included + "/"):
-            is_child = True
-            break
+    is_child = any(path.is_relative_to(included) and path != included for included in minimal)
 
     if not is_child:
-      # Check if any existing paths are children of this one, and remove them
-        minimal = [p for p in minimal if not p.startswith(path + "/")]
+        # Check if any existing paths are children of this one, and remove them
+        minimal = [p for p in minimal if not p.is_relative_to(path) or p == path]
         minimal.append(path)
 
 # Output as relative paths
 for path in minimal:
-    print(path)
-PYTHON_SCRIPT
+    print(str(path))
+' "$work_dir"
   else
-    # Fallback: if fd is not available, just list top-level items
-    # (less accurate but still works)
-    ls -A1 "$work_dir" 2>/dev/null | while read item; do
-      if [[ -n "$item" ]]; then
-        echo "$item"
-      fi
-    done
-  fi
-}
-
-# Generate .dockerignore from .claudeignore if it exists
-generate_dockerignore() {
-  local work_dir=$1
-  local dockerignore="$work_dir/.dockerignore"
-  local claudeignore="$work_dir/.claudeignore"
-
-  # Always start fresh
-  > "$dockerignore"
-
-  # Add default excludes
-  cat >> "$dockerignore" <<EOF
-.git
-.gitignore
-.claudeignore
-.dockerignore
-node_modules
-.env
-.env.local
-EOF
-
-  # Add patterns from .claudeignore if it exists
-  if [[ -f "$claudeignore" ]]; then
-    grep -v '^\s*$' "$claudeignore" | grep -v '^\s*#' >> "$dockerignore" || true
+    exit -1
   fi
 }
 
@@ -168,9 +138,6 @@ WORKING_DIR=$( cd "$1" > /dev/null && pwd )
 cd "$WORKING_DIR" || exit 1
 
 touch "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
-
-# Generate .dockerignore from .claudeignore
-generate_dockerignore "$WORKING_DIR"
 
 # Generate compose override with selective mounts if .claudeignore exists
 generate_compose_override "$WORKING_DIR"
