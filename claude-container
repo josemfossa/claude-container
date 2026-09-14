@@ -15,6 +15,123 @@ Launch a containerized Claude workspace in the given directory.
 Options:
   -b, --build    Force a rebuild of the container image
   -h, --help     Show this help message and exit
+
+Files:
+  .claudeignore  Patterns of files/directories to exclude from the container
+                 (format similar to .gitignore)
+EOF
+}
+
+# Generate volume mounts from .claudeignore, computing minimal spanning set
+generate_volume_mounts() {
+  local work_dir=$1
+  local claudeignore="$work_dir/.claudeignore"
+
+  # If fd is available, use it to enumerate non-ignored items
+  if command -v fd &> /dev/null; then
+    # Use fd to get all non-ignored items, then compute minimal mount set with Python
+    fd --ignore-file "$claudeignore" . "$work_dir" 2>/dev/null | python3 << 'PYTHON_SCRIPT'
+import sys
+import os
+from pathlib import Path
+
+# Read paths from stdin (relative to work_dir)
+paths = set()
+for line in sys.stdin:
+    path = line.strip()
+    if path and path != ".":
+        paths.add(path)
+
+if not paths:
+    sys.exit(0)
+
+# Compute minimal spanning set: remove children of already-included paths
+minimal = []
+sorted_paths = sorted(paths)
+
+for path in sorted_paths:
+    # Check if this path is a child of any already-included path
+    is_child = False
+    for included in minimal:
+        if path.startswith(included + "/"):
+            is_child = True
+            break
+
+    if not is_child:
+      # Check if any existing paths are children of this one, and remove them
+        minimal = [p for p in minimal if not p.startswith(path + "/")]
+        minimal.append(path)
+
+# Output as relative paths
+for path in minimal:
+    print(path)
+PYTHON_SCRIPT
+  else
+    # Fallback: if fd is not available, just list top-level items
+    # (less accurate but still works)
+    ls -A1 "$work_dir" 2>/dev/null | while read item; do
+      if [[ -n "$item" ]]; then
+        echo "$item"
+      fi
+    done
+  fi
+}
+
+# Generate .dockerignore from .claudeignore if it exists
+generate_dockerignore() {
+  local work_dir=$1
+  local dockerignore="$work_dir/.dockerignore"
+  local claudeignore="$work_dir/.claudeignore"
+
+  # Always start fresh
+  > "$dockerignore"
+
+  # Add default excludes
+  cat >> "$dockerignore" <<EOF
+.git
+.gitignore
+.claudeignore
+.dockerignore
+node_modules
+.env
+.env.local
+EOF
+
+  # Add patterns from .claudeignore if it exists
+  if [[ -f "$claudeignore" ]]; then
+    grep -v '^\s*$' "$claudeignore" | grep -v '^\s*#' >> "$dockerignore" || true
+  fi
+}
+
+# Generate compose override file with selective volume mounts
+generate_compose_override() {
+  local work_dir=$1
+  local claudeignore="$work_dir/.claudeignore"
+  local override_file="$work_dir/compose.override.yml"
+
+  # Only generate override if .claudeignore exists
+  if [[ ! -f "$claudeignore" ]]; then
+    rm -f "$override_file"
+    return
+  fi
+
+  # Get minimal mount set
+  local mounts_yaml=""
+  while IFS= read -r mount_path; do
+    if [[ -n "$mount_path" ]]; then
+      mounts_yaml+="      - \${CONTEXT}/$mount_path:/workspace/$mount_path"$'\n'
+    fi
+  done < <(generate_volume_mounts "$work_dir")
+
+  # Always include config mounts
+  cat > "$override_file" <<EOF
+services:
+  claude-auth-workspace:
+    volumes:
+      - \${CLAUDE_CONFIG_DIR:-~}/.claude.json:/home/node/.claude.json
+      - \${CLAUDE_CONFIG_DIR:-~}/.claude:/home/node/.claude
+      - \${CLAUDE_CONFIG_DIR:-~}/.claudeconfig:/home/node/.config/anthropic/
+${mounts_yaml}
 EOF
 }
 
@@ -50,8 +167,22 @@ echo "RUN DIR: $RUN_DIR"
 WORKING_DIR=$( cd "$1" > /dev/null && pwd )
 cd "$WORKING_DIR" || exit 1
 
+touch "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+
+# Generate .dockerignore from .claudeignore
+generate_dockerignore "$WORKING_DIR"
+
+# Generate compose override with selective mounts if .claudeignore exists
+generate_compose_override "$WORKING_DIR"
+
+# Compose files: base + optional override
+COMPOSE_FILES=("-f" "$RUN_DIR/compose.yml")
+if [[ -f "$WORKING_DIR/compose.override.yml" ]]; then
+  COMPOSE_FILES+=("-f" "$WORKING_DIR/compose.override.yml")
+fi
+
 if [[ $BUILD -eq 1 ]]; then
-  CONTEXT="$WORKING_DIR" CLAUDE_CONTAINER_DIR="$RUN_DIR" podman compose -f "$RUN_DIR/compose.yml" --in-pod false run --rm --build claude-auth-workspace
+  CONTEXT="$WORKING_DIR" CLAUDE_CONTAINER_DIR="$RUN_DIR" CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME}" podman compose "${COMPOSE_FILES[@]}" --in-pod false run --rm --build claude-auth-workspace
 else
-  CONTEXT="$WORKING_DIR" CLAUDE_CONTAINER_DIR="$RUN_DIR" podman compose -f "$RUN_DIR/compose.yml" --in-pod false run --rm claude-auth-workspace
+  CONTEXT="$WORKING_DIR" CLAUDE_CONTAINER_DIR="$RUN_DIR" CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME}" podman compose "${COMPOSE_FILES[@]}" --in-pod false run --rm claude-auth-workspace
 fi

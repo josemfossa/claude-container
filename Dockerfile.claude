@@ -52,4 +52,4 @@ ENV PATH=$PATH:/usr/local/share/npm-global/bin
 # Install Claude
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
-CMD ["claude", "--dangerously-skip-permissions"]
+CMD ["claude"]

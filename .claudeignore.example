@@ -1,0 +1,39 @@
+# .claudeignore
+#
+# Patterns in this file will be excluded from the Claude container.
+# Format is similar to .gitignore:
+# - Lines starting with # are comments
+# - Blank lines are ignored
+# - Patterns use standard glob syntax (* ? [ ])
+#
+# These are automatically excluded:
+#   .git
+#   .gitignore
+#   .claudeignore
+#   .dockerignore
+#   node_modules
+#   .env
+#   .env.local
+#
+# Add additional patterns below:
+
+# Large directories or files not needed in container
+dist/
+build/
+.next/
+coverage/
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+
+# Large media files
+*.mp4
+*.mov
+*.mkv
+
+# Private/sensitive files
+.ssh/
+.aws/
+secrets/
