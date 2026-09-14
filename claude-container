@@ -5,6 +5,7 @@ trap 'exit 1' INT
 
 BUILD=0
 IMAGE_NAME="localhost/claude-container_claude-auth-workspace"
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 usage() {
   cat <<EOF
@@ -23,187 +24,40 @@ EOF
 }
 
 # Generate volume mounts from .claudeignore, computing minimal spanning set
-generate_volume_mounts() (
+generate_volume_mounts() {
   local work_dir=$1
-  local claudeignore
-  local tmp_dir
-  local included_file
-  local all_file
-
-  work_dir=$(realpath "$work_dir") || exit 1
-  claudeignore="$work_dir/.claudeignore"
+  local claudeignore="$work_dir/.claudeignore"
 
   if ! command -v fdfind >/dev/null 2>&1; then
-    printf 'Error: fdfind is not available\n' >&2
-    exit 127
+    echo "Error: fdfind is required" >&2
+    return 1
+  fi
+
+  if [[ ! -d "$work_dir" ]]; then
+    echo "Error: not a directory: $work_dir" >&2
+    return 1
   fi
 
   if [[ ! -f "$claudeignore" ]]; then
-    printf 'Error: %s does not exist\n' "$claudeignore" >&2
-    exit 1
+    echo "Error: .claudeignore not found: $claudeignore" >&2
+    return 1
   fi
 
-  tmp_dir=$(mktemp -d) || exit 1
-  trap 'rm -rf "$tmp_dir"' EXIT
-
-  included_file="$tmp_dir/included"
-  all_file="$tmp_dir/all"
-
-  # Files permitted by .claudeignore.
-  #
-  # --hidden ensures hidden files are considered.
-  # --no-ignore disables .gitignore, .ignore, and .fdignore processing.
-  # --ignore-file then applies the explicit .claudeignore rules.
-  if ! fdfind \
-      --hidden \
-      --no-ignore \
-      --type file \
-      --absolute-path \
-      --print0 \
-      --ignore-file "$claudeignore" \
-      . "$work_dir" >"$included_file"; then
-    printf 'Error: failed to enumerate included files\n' >&2
-    exit 1
-  fi
-
-  # Every file physically present, without applying .claudeignore.
-  if ! fdfind \
-      --hidden \
-      --no-ignore \
-      --type file \
-      --absolute-path \
-      --print0 \
-      . "$work_dir" >"$all_file"; then
-    printf 'Error: failed to enumerate all files\n' >&2
-    exit 1
-  fi
-
-  python3 - "$work_dir" "$included_file" "$all_file" <<'PY'
-import os
-import sys
-from pathlib import Path
-
-
-work_dir = Path(sys.argv[1]).resolve()
-included_list = Path(sys.argv[2])
-all_list = Path(sys.argv[3])
-
-
-def read_null_delimited(path: Path) -> set:
-    result = set()
-
-    for raw_path in path.read_bytes().split(b"\0"):
-        if not raw_path:
-            continue
-
-        decoded = os.fsdecode(raw_path)
-        absolute = Path(os.path.abspath(decoded))
-
-        try:
-            relative = absolute.relative_to(work_dir)
-        except ValueError:
-            # Ignore anything unexpectedly outside work_dir.
-            continue
-
-        result.add(relative)
-
-    return result
-
-
-included_files = read_null_delimited(included_list)
-all_files = read_null_delimited(all_list)
-
-if not included_files:
-    sys.exit(0)
-
-# Be conservative if the two fdfind calls somehow produced inconsistent
-# results. Any included file must also be considered part of the complete set.
-all_files.update(included_files)
-
-excluded_files = all_files - included_files
-
-# A directory is unsafe if it contains at least one excluded file.
-#
-# Record every ancestor of every excluded file. This makes safety checks
-# constant-time instead of repeatedly scanning every excluded file.
-unsafe_directories: set[Path] = set()
-
-for excluded_file in excluded_files:
-    parent = excluded_file.parent
-
-    while True:
-        unsafe_directories.add(parent)
-
-        if parent == Path("."):
-            break
-
-        parent = parent.parent
-
-
-mounts: set[Path] = set()
-
-for included_file in included_files:
-    ancestors = []
-    parent = included_file.parent
-
-    while True:
-        ancestors.append(parent)
-
-        if parent == Path("."):
-            break
-
-        parent = parent.parent
-
-    # Try ancestors from highest to lowest. The first safe ancestor is the
-    # largest directory that can be mounted without exposing excluded files.
-    selected = included_file
-
-    for directory in reversed(ancestors):
-        if directory not in unsafe_directories:
-            selected = directory
-            break
-
-    mounts.add(selected)
-
-
-# Remove redundant entries defensively. This normally has no effect because
-# selecting the highest safe directory already produces a minimal cover.
-minimal_mounts: list[Path] = []
-
-for candidate in sorted(
-    mounts,
-    key=lambda path: (len(path.parts), os.fsencode(str(path))),
-):
-    covered = any(
-        candidate == existing or existing in candidate.parents
-        for existing in minimal_mounts
-    )
-
-    if not covered:
-        minimal_mounts.append(candidate)
-
-
-# Use NUL-safe sorting internally, but retain the original line-oriented
-# output contract. Newlines in filenames remain inherently ambiguous here.
-for mount in sorted(minimal_mounts, key=lambda path: os.fsencode(str(path))):
-    print(os.fsdecode(os.fsencode(str(mount))))
-PY
-)
+  WORK_DIR="$work_dir" CLAUDEIGNORE="$claudeignore" python3 "${SCRIPT_DIR}/fd_helper.py"
+}
 
 # Generate compose override file with selective volume mounts
 generate_compose_override() {
   local work_dir=$1
   local claudeignore="$work_dir/.claudeignore"
-  local override_file="$work_dir/compose.override.yml"
+
+  local override_file="$(mktemp -d)/compose.override.yml"
 
   # Only generate override if .claudeignore exists
   if [[ ! -f "$claudeignore" ]]; then
     rm -f "$override_file"
     return
   fi
-
-  generate_volume_mounts $work_dir
-  exit -1
 
   # Get minimal mount set
   local mounts_yaml=""
@@ -223,6 +77,8 @@ services:
       - \${CLAUDE_CONFIG_DIR:-~}/.claudeconfig:/home/node/.config/anthropic/
 ${mounts_yaml}
 EOF
+
+  echo "${override_file}"
 }
 
 # Parse arguments
@@ -260,16 +116,15 @@ cd "$WORKING_DIR" || exit 1
 touch "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
 
 # Generate compose override with selective mounts if .claudeignore exists
-generate_compose_override "$WORKING_DIR"
+OVERRIDE_FILE=$(generate_compose_override "$WORKING_DIR")
 
 # Compose files: base + optional override
-COMPOSE_FILES=("-f" "$RUN_DIR/compose.yml")
-if [[ -f "$WORKING_DIR/compose.override.yml" ]]; then
-  COMPOSE_FILES+=("-f" "$WORKING_DIR/compose.override.yml")
-fi
+COMPOSE_FILES=("-f" "$RUN_DIR/compose.yml" "-f" "$OVERRIDE_FILE")
 
 if [[ $BUILD -eq 1 ]]; then
   CONTEXT="$WORKING_DIR" CLAUDE_CONTAINER_DIR="$RUN_DIR" CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME}" podman compose "${COMPOSE_FILES[@]}" --in-pod false run --rm --build claude-auth-workspace
 else
   CONTEXT="$WORKING_DIR" CLAUDE_CONTAINER_DIR="$RUN_DIR" CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME}" podman compose "${COMPOSE_FILES[@]}" --in-pod false run --rm claude-auth-workspace
 fi
+
+rm $OVERRIDE_FILE
