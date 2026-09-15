@@ -5,7 +5,16 @@ trap 'exit 1' INT
 
 BUILD=0
 IMAGE_NAME="localhost/claude-container_claude-auth-workspace"
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+
+SOURCE="${BASH_SOURCE[0]}"
+
+while [ -L "$SOURCE" ]; do
+    SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" > /dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$SCRIPT_DIR/$SOURCE"
+done
+
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" > /dev/null 2>&1 && pwd)"
 
 usage() {
   cat <<EOF
