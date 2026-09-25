@@ -4,6 +4,8 @@ set -euo pipefail
 trap 'exit 1' INT
 
 BUILD=0
+RISKY=0
+IMAGE=""
 IMAGE_NAME="localhost/claude-container_claude-auth-workspace"
 
 SOURCE="${BASH_SOURCE[0]}"
@@ -23,12 +25,28 @@ Usage: $(basename "$0") [OPTIONS] <directory>
 Launch a containerized Claude workspace in the given directory.
 
 Options:
-  -b, --build    Force a rebuild of the container image
-  -h, --help     Show this help message and exit
+  -b, --build       Force a rebuild of the container image
+  -h, --help        Show this help message and exit
+  -i, --image NAME  Use the given container image instead of building one
+  --risky           Allow launching when .claude_mounts.yaml is not ignored
 
 Files:
-  .claudeignore  Patterns of files/directories to exclude from the container
-                 (format similar to .gitignore)
+  .claudeignore      Patterns of files/directories to exclude from the container
+                     (format similar to .gitignore)
+  .claude_mounts.yaml  Optional compose override for extra volume mounts
+  .claude_start.sh    Optional script run in the container instead of claude
+                       (mounted read-only, always excluded from workspace)
+
+Checkpointing:
+  To save the current container state as an image, find the running container
+  and commit it:
+
+    podman ps
+    podman commit <container-name> my-checkpoint
+
+  Then resume it later with:
+
+    claude-container --image my-checkpoint <directory>
 EOF
 }
 
@@ -48,37 +66,53 @@ generate_volume_mounts() {
   fi
 
   if [[ ! -f "$claudeignore" ]]; then
-    return 0
+    echo "Error: .claudeignore not found: $claudeignore" >&2
+    return 1
   fi
 
-  WORK_DIR="$work_dir" CLAUDEIGNORE="$claudeignore" python3 "${SCRIPT_DIR}/fd_helper.py" || return 1
+  # .claude_start.sh is never part of the workspace mounts; it is mounted
+  # separately and read-only.
+  local tmp_ignore
+  tmp_ignore="$(mktemp)"
+  cat "$claudeignore" > "$tmp_ignore"
+  echo ".claude_start.sh" >> "$tmp_ignore"
+
+  local status=0
+  WORK_DIR="$work_dir" CLAUDEIGNORE="$tmp_ignore" python3 "${SCRIPT_DIR}/fd_helper.py" || status=$?
+  rm -f "$tmp_ignore"
+  return $status
 }
 
 # Generate compose override file with selective volume mounts
 generate_compose_override() {
   local work_dir=$1
+  local mounts=$2
   local claudeignore="$work_dir/.claudeignore"
-
-  local override_dir
-  override_dir=$(mktemp -d) || return 1
-  local override_file="$override_dir/compose.override.yml"
 
   if [[ ! -f "$claudeignore" ]]; then
     echo "Error: .claudeignore not found: $claudeignore" >&2
-    rm -rf "$override_dir"
     return 1
   fi
 
-  # Get minimal mount set
-  local mounts_output
-  mounts_output=$(generate_volume_mounts "$work_dir") || return 1
+  mkdir -p "${work_dir}/.claude"
+
+  local override_file
+  override_file="$(mktemp -d)/compose.override.yml"
 
   local mounts_yaml=""
   while IFS= read -r mount_path; do
     if [[ -n "$mount_path" ]]; then
       mounts_yaml+="      - \${CONTEXT}/$mount_path:/workspace/$mount_path"$'\n'
     fi
-  done <<< "$mounts_output"
+  done <<< "$mounts"
+
+  # Mount .claude_start.sh read-only and run it instead of claude
+  local start_mount=""
+  local start_command=""
+  if [[ -f "$work_dir/.claude_start.sh" ]]; then
+    start_mount="      - \${CONTEXT}/.claude_start.sh:/workspace/.claude_start.sh:ro"$'\n'
+    start_command="    command: bash /workspace/.claude_start.sh"$'\n'
+  fi
 
   # Always include config mounts
   cat > "$override_file" <<EOF
@@ -88,9 +122,29 @@ services:
       - \${CLAUDE_CONFIG_DIR:-~}/.claude.json:/home/node/.claude.json
       - \${CLAUDE_CONFIG_DIR:-~}/.claude:/home/node/.claude
       - \${CLAUDE_CONFIG_DIR:-~}/.claudeconfig:/home/node/.config/anthropic/
-${mounts_yaml}
+${mounts_yaml}${start_mount}${start_command}
 EOF
 
+  echo "${override_file}"
+}
+
+# Return 0 if .claude_mounts.yaml would be exposed inside the container.
+# It is exposed when the whole workdir (.) or the file itself is mounted.
+is_exposed() {
+  local mounts=$1
+  grep -qxF "." <<< "$mounts" || grep -qxF ".claude_mounts.yaml" <<< "$mounts"
+}
+
+# Generate compose override to use a specific image instead of building
+generate_image_override() {
+  local image=$1
+  local override_file
+  override_file="$(mktemp -d)/compose.image.yml"
+  cat > "$override_file" <<EOF
+services:
+  claude-auth-workspace:
+    image: ${image}
+EOF
   echo "${override_file}"
 }
 
@@ -105,6 +159,18 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       usage
       exit 0
+      ;;
+    --risky)
+      RISKY=1
+      shift
+      ;;
+    -i|--image)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --image requires an argument" >&2
+        exit 1
+      fi
+      IMAGE="$2"
+      shift 2
       ;;
     *)
       POSITIONAL_ARGS+=("$1")
@@ -128,11 +194,39 @@ cd "$WORKING_DIR" || exit 1
 
 touch "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
 
-# Generate compose override with selective mounts if .claudeignore exists
-OVERRIDE_FILE=$(generate_compose_override "$WORKING_DIR") || exit 1
+# Generate compose override with selective mounts
+MOUNTS=$(generate_volume_mounts "$WORKING_DIR") || exit 1
+OVERRIDE_FILE=$(generate_compose_override "$WORKING_DIR" "$MOUNTS") || exit 1
 
 # Compose files: base + optional override
 COMPOSE_FILES=("-f" "$RUN_DIR/compose.yml" "-f" "$OVERRIDE_FILE")
+
+# Add per-project extra mounts if .claude_mounts.yaml exists
+MOUNTS_FILE="$WORKING_DIR/.claude_mounts.yaml"
+if [[ -f "$MOUNTS_FILE" ]]; then
+  if is_exposed "$MOUNTS"; then
+    if [[ $RISKY -eq 0 ]]; then
+      echo "Error: .claude_mounts.yaml is not ignored by .claudeignore." >&2
+      echo "It defines container mounts and, if visible inside the container," >&2
+      echo "can be trivially modified to escape the container." >&2
+      echo "Add it to .claudeignore or pass --risky to proceed." >&2
+      exit 1
+    fi
+    echo "Warning: .claude_mounts.yaml is not in .claudeignore (--risky given)." >&2
+  fi
+  COMPOSE_FILES+=("-f" "$MOUNTS_FILE")
+fi
+
+# Use a specific image instead of building
+IMAGE_OVERRIDE=""
+if [[ -n "$IMAGE" ]]; then
+  if [[ $BUILD -eq 1 ]]; then
+    echo "Error: --build and --image are mutually exclusive" >&2
+    exit 1
+  fi
+  IMAGE_OVERRIDE=$(generate_image_override "$IMAGE")
+  COMPOSE_FILES+=("-f" "$IMAGE_OVERRIDE")
+fi
 
 if [[ $BUILD -eq 1 ]]; then
   CONTEXT="$WORKING_DIR" CLAUDE_CONTAINER_DIR="$RUN_DIR" CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME}" podman compose "${COMPOSE_FILES[@]}" --in-pod false run --rm --build claude-auth-workspace
@@ -140,4 +234,8 @@ else
   CONTEXT="$WORKING_DIR" CLAUDE_CONTAINER_DIR="$RUN_DIR" CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME}" podman compose "${COMPOSE_FILES[@]}" --in-pod false run --rm claude-auth-workspace
 fi
 
-rm -rf "$(dirname "$OVERRIDE_FILE")"
+rm -f "$OVERRIDE_FILE"
+if [[ -n "$IMAGE_OVERRIDE" ]]; then
+  rm -f "$IMAGE_OVERRIDE"
+fi
+exit 0

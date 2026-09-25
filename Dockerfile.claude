@@ -21,6 +21,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   #vim \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Other development stuff
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  python3 \
+  python3-pip \
+  python3-venv \
+  python3-dev \
+  && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+
 # Ensure default node user has access to /usr/local/share
 RUN mkdir -p /usr/local/share/npm-global && \
   chown -R node:node /usr/local/share
@@ -41,6 +50,10 @@ RUN mkdir -p /workspace /home/node/.claude && \
   chown -R node:node /workspace /home/node/.claude
 
 WORKDIR /workspace
+
+# Allow passwordless sudo
+RUN echo "$USERNAME ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
+  && chmod 0440 /etc/sudoers.d/$USERNAME
 
 # Set up non-root user
 USER node
