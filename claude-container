@@ -5,6 +5,7 @@ trap 'exit 1' INT
 
 BUILD=0
 RISKY=0
+SSH_AGENT_FWD=0
 IMAGE=""
 IMAGE_NAME="localhost/claude-container_claude-auth-workspace"
 
@@ -28,6 +29,7 @@ Options:
   -b, --build       Force a rebuild of the container image
   -h, --help        Show this help message and exit
   -i, --image NAME  Use the given container image instead of building one
+  --ssh-agent       Forward the host SSH agent (\$SSH_AUTH_SOCK) into the container
   --risky           Allow launching when .claude_mounts.yaml is not ignored
 
 Files:
@@ -114,6 +116,22 @@ generate_compose_override() {
     start_command="    command: bash /workspace/.claude_start.sh"$'\n'
   fi
 
+  # Optionally forward the host SSH agent
+  local ssh_mount=""
+  local ssh_extra=""
+  if [[ $SSH_AGENT_FWD -eq 1 ]]; then
+    if [[ -z "${SSH_AUTH_SOCK:-}" || ! -S "$SSH_AUTH_SOCK" ]]; then
+      echo "Error: --ssh-agent given but SSH_AUTH_SOCK is unset or not a socket" >&2
+      return 1
+    fi
+    ssh_mount="      - ${SSH_AUTH_SOCK}:/run/ssh-agent.sock"$'\n'
+    ssh_extra="    environment:
+      SSH_AUTH_SOCK: /run/ssh-agent.sock
+    security_opt:
+      - label=disable
+"
+  fi
+
   # Always include config mounts
   cat > "$override_file" <<EOF
 services:
@@ -122,7 +140,7 @@ services:
       - \${CLAUDE_CONFIG_DIR:-~}/.claude.json:/home/node/.claude.json
       - \${CLAUDE_CONFIG_DIR:-~}/.claude:/home/node/.claude
       - \${CLAUDE_CONFIG_DIR:-~}/.claudeconfig:/home/node/.config/anthropic/
-${mounts_yaml}${start_mount}${start_command}
+${mounts_yaml}${ssh_mount}${start_mount}${ssh_extra}${start_command}
 EOF
 
   echo "${override_file}"
@@ -162,6 +180,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --risky)
       RISKY=1
+      shift
+      ;;
+    --ssh-agent)
+      SSH_AGENT_FWD=1
       shift
       ;;
     -i|--image)
