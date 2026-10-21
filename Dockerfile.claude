@@ -1,4 +1,4 @@
-FROM node:20
+FROM node:latest
 
 ARG CLAUDE_CODE_VERSION=latest
 
@@ -57,6 +57,10 @@ RUN echo "$USERNAME ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
 
 # Set up non-root user
 USER node
+
+# Install aven task manager
+RUN curl -fsSL https://raw.githubusercontent.com/raine/aven/main/scripts/install | bash
+ENV PATH="$PATH:/home/node/.local/bin"
 
 # Install global packages
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
