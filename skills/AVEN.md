@@ -21,6 +21,7 @@ You are in a container, to use aven, point it to the database located at `--db ~
 - **Long text**: use `--description-stdin` or `note --stdin` with a quoted heredoc (`<<'EOF'`). Put the rationale, scope, acceptance criteria and real file/line references in it, state measured numbers as measured and mark estimates as estimates.
 - **Status**: the default is `inbox`. Use `todo` or `active` only when the user says the work is triaged or started. Report the qualified refs printed by `add` (for example `DF-XXXX`).
 - **Scope**: do exactly what was asked and say what was left out (optional extras, links not made). Status changes, epic membership and soft deletes are reversible, so say how to undo them.
+- **Unexpected changes**: The user may use aven in the background, if tasks change status or similar without any command being run, this is expected and is the user running commands.
 
 
 # Aven CLI Primer
