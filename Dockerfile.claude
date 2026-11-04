@@ -62,9 +62,13 @@ USER node
 RUN curl -fsSL https://raw.githubusercontent.com/raine/aven/main/scripts/install | bash
 ENV PATH="$PATH:/home/node/.local/bin"
 
+RUN aven update --yes
+
 # Install global packages
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=$PATH:/usr/local/share/npm-global/bin
+
+RUN npm i @ast-grep/cli -g
 
 # Install Claude
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
