@@ -45,7 +45,8 @@ the files tools need into the repo root, and hide everything via
 - Put the symlink and exclude creation in an idempotent `install.sh` inside the
   sidecar so a fresh clone is restored with one command. The exclude entries
   live in `.git/` and are lost if the clone is deleted; `install.sh` re-adds them.
-- Sidecar `.gitignore`: the extracted toolchain and temp files.
+- Sidecar `.gitignore`: temp files (and a legacy in-sidecar toolchain copy if
+  one exists).
 - Tell the user to commit the sidecar themselves.
 
 Contents: container image file, `justfile`, a drift-check script, `.clangd`,
@@ -56,6 +57,8 @@ Helix config dir, one editorconfig file, `install.sh`.
 - Image: Ubuntu LTS matching CI, the **same ARM GNU toolchain release as CI**
   (download the official tarball in a separate stage, copy it in), plus `make`
   and `bear`. No editor in it if the user edits on the host.
+- Define the toolchain version **once**, as a `just` variable, and pass it to the
+  image build with `--build-arg` (the Dockerfile default is only a fallback).
 - Build recipe: run the existing CI Makefile in a throwaway
   `podman run --rm` with `--cap-drop=all --security-opt=no-new-privileges`,
   mounting the repo **at the same absolute path as on the host** (so paths in
@@ -66,6 +69,14 @@ Helix config dir, one editorconfig file, `install.sh`.
 - Other recipes: clean, shell, and `toolchain` (copy `/opt/<toolchain>` out of
   the image with `podman create` + `podman cp` so the host clangd can read the
   compiler's system headers).
+- Put the host copy of the toolchain (~1 GB) in a **shared user-wide location**,
+  not in the sidecar: `env("ARM_GNU_DIR", data_directory() / "arm-gnu" /
+  <version>)`. One copy per version serves every checkout, worktree and project
+  on that release. Make `toolchain` a no-op if `bin/arm-none-eabi-gcc` already
+  exists, and copy to `<dir>.tmp` then `mv` so an interrupted copy never looks
+  complete. Prefer user-wide to system-wide (no root, read-only data). Old
+  versions are not removed automatically. (Using the IDE's bundled ST toolchain
+  would save disk but differs from the release CI uses; not recommended.)
 - `compdb` recipe: run `bear -- make -B BUILD=<tmp dir>` in the container
   (command-line variables override Makefile `:=`), then `sed` the container
   toolchain path and the bare `arm-none-eabi-gcc/g++` first arguments to the
@@ -148,7 +159,22 @@ CubeIDE" fails.
 Optional later: generate the CI source list from `subdir.mk`. That is a repo
 change, so it is the user's decision.
 
-## 6. Working style that worked
+## 6. New clones and worktrees
+
+- New clone of the same project: `git clone <private sidecar remote> .devenv`
+  from the repo root (it must not exist yet), then `./.devenv/install.sh`, then
+  `just image`, `just toolchain` (instant if the shared copy exists) and
+  `just compdb`. The sidecar needs a private remote, or it only exists locally.
+- A git worktree behaves like an independent folder: it needs its own sidecar
+  clone, `install.sh` and `just compdb` (generated paths are absolute).
+  `.git/info/exclude` is shared across worktrees, so the entries already exist.
+- Use a separate `CUBE_WS` per clone/worktree: Eclipse maps a project name to one
+  location, so two checkouts importing into one workspace can conflict.
+- A different STM32 project is **not** a straight clone: app name, Makefile and
+  source-list paths, the directories that get the nested editorconfig, tab
+  choice and toolchain version are project-specific. Adapt them via this skill.
+
+## 7. Working style that worked
 
 - Report only what you verified. You cannot run podman/just/CubeIDE; label
   everything that way and ask the user to paste the first error.
