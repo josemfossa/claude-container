@@ -57,6 +57,11 @@ Helix config dir, one editorconfig file, `install.sh`.
 - Image: Ubuntu LTS matching CI, the **same ARM GNU toolchain release as CI**
   (download the official tarball in a separate stage, copy it in), plus `make`
   and `bear`. No editor in it if the user edits on the host.
+- Tag the image with the toolchain version (`<name>:<version>`). A bare tag is
+  global per user: rebuilding it for another release silently changes every
+  checkout and project that uses it. Containers are per-command (`--rm`) and not
+  shared; only the read-only image is. Old image tags are not removed
+  automatically (`podman images`, `podman image rm`; avoid `system prune -a`).
 - Define the toolchain version **once**, as a `just` variable, and pass it to the
   image build with `--build-arg` (the Dockerfile default is only a fallback).
 - Build recipe: run the existing CI Makefile in a throwaway
