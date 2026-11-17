@@ -1,0 +1,46 @@
+# Project-local Helix language config (commit as .helix/languages.toml).
+# Merged over the user's global config, so list only what this project needs.
+# Keep only the blocks for the languages the project uses.
+
+# --- TypeScript / JavaScript with Deno's language server ---
+# Deno 2 asks for its settings under a "deno" section and Helix answers from the
+# `config` table, so the settings must be nested as well as flat, otherwise the
+# server starts but gives no hover or diagnostics.
+[language-server.deno-lsp]
+command = "deno"
+args = ["lsp"]
+environment = { NO_COLOR = "1" }
+config = { enable = true, lint = true, deno = { enable = true, lint = true } }
+
+[[language]]
+name = "typescript"
+language-servers = ["deno-lsp"]
+
+[[language]]
+name = "tsx"
+language-servers = ["deno-lsp"]
+
+[[language]]
+name = "javascript"
+language-servers = ["deno-lsp"]
+
+[[language]]
+name = "jsx"
+language-servers = ["deno-lsp"]
+
+# --- Python: ruff plus one type checker ---
+# ty is fast (default); pyright gives finer analysis. Swap by moving the comment.
+[language-server.ty]
+command = "ty"
+args = ["server"]
+
+[language-server.ruff]
+command = "ruff"
+args = ["server"]
+
+[[language]]
+name = "python"
+language-servers = ["ruff", "ty"]
+# language-servers = ["ruff", "pyright"]
+auto-format = false
+formatter = { command = "ruff", args = ["format", "-"] }
