@@ -50,7 +50,11 @@ the files tools need into the repo root, and hide everything via
 - Tell the user to commit the sidecar themselves.
 
 Contents: container image file, `justfile`, a drift-check script, `.clangd`,
-Helix config dir, one editorconfig file, `install.sh`.
+Helix config dir, one editorconfig file, `clang-format/` profiles, `install.sh`.
+
+Gotcha: `sed -i` (and most "in-place" editors) on a symlink replaces it with a
+regular file, so the edit never reaches the sidecar. Edit `<repo>/.devenv/<file>`
+directly, or `ls -l` the target first.
 
 ## 3. Containerised build (podman + just)
 
@@ -87,6 +91,9 @@ Helix config dir, one editorconfig file, `install.sh`.
   toolchain path and the bare `arm-none-eabi-gcc/g++` first arguments to the
   host copy and write `compile_commands.json` in the repo root.
 
+- Image also carries a native `gcc` + `libc6-dev` when the repo has host-side unit
+  tests (section 4b); the ARM tools are prefixed (`arm-none-eabi-gcc`), so the two never clash.
+
 just gotchas:
 - `{{...}}` is **not** interpolated inside string literals. Use concatenation:
   `mk := "make -j" + num_cpus() + " APP=" + app`. A literal `{{num_cpus()}}`
@@ -117,6 +124,42 @@ directory before deciding, and never reformat to "fix" it.
   root `.editorconfig`, and this changes rendering only, not indentation.
 - Do not edit the tracked `.editorconfig`. The repo's may only contain
   Visual-Studio `cpp_*` keys, which no editor honours for this.
+
+## 4b. Host-side unit tests (Unity + native gcc, in the container)
+
+If the repo has a `test/` directory with its own Makefile (Unity, ASAN/UBSan,
+one `test_<name>.c` + optional `.mk` with `SRCS`/`INCS` per test):
+- `test` recipe: `just _run make -C test test {{args}}` (extra args e.g. `T=name`, `SAN=`).
+- `test-compdb` recipe: writes `test/compile_commands.json` (clangd uses the
+  nearest one, so it does not clash with the firmware one in the root).
+- Give the test Makefile a `build` target (compile and link only) next to `test`
+  (build and run), and make `test-compdb` call `build`, not `test`:
+  `bear` injects a library with `LD_PRELOAD`, which the test binaries inherit,
+  and ASAN then aborts with "ASan runtime does not come first in initial library
+  list". Recording compile commands does not need the tests to run.
+- Pass `BUILD=/tmp/...` (absolute) to keep the repo clean. The run loop must not
+  do `./$$t`: with an absolute path it becomes `.//tmp/...: not found`. Loop over
+  `$(abspath $(BINS))`.
+- A Makefile that prints "all tests passed" must propagate failures: Unity's
+  `return UNITY_END();` in `main`, and exit status checked per binary.
+- When an ASAN binary aborts, piped output is lost; `script -qec ./bin /dev/null`
+  shows it.
+
+### clang-format profiles
+
+Different directories follow different styles (tabs, spaces, vendored). Keep one
+template per profile in `.devenv/clang-format/<profile>.clang-format` and a `clang-format`
+recipe that symlinks it as `<dir>/.clang-format` for each directory in a list
+(hidden via `.git/info/exclude`; nearest file wins; repo-root file is an "off"
+fallback; vendored dirs such as `test/unity` get "off"). Re-runnable; a real
+differing file is skipped unless `FORCE=1`.
+- Tabs profile: `UseTab: AlignWithSpaces` (tabs only for leading indentation,
+  spaces for alignment of `=`, trailing comments, declarations). Plain `Always`
+  or `ForContinuationAndIndentation` puts tabs in alignment and looks broken in
+  git previews and with other tab widths.
+- `ColumnLimit: 0` and `ReflowComments: false` so existing code is mostly untouched.
+- Wrap generated data and lookup tables in `// clang-format off` / `// clang-format on`.
+- Add new library directories to the right list in the recipe.
 
 ## 5. Headless CubeIDE and the drift check (host only)
 
@@ -186,7 +229,7 @@ change, so it is the user's decision.
 - Prototype pure-python pieces (the checker) directly against any existing
   `Debug/` snapshot to get a real result before the host run.
 - Give the user the exact commands to run (`image`, `build`, `toolchain`,
-  `compdb`, `cube-build`, `check`) and what a good result looks like.
+  `compdb`, `test`, `test-compdb`, `clang-format`, `cube-build`, `check`) and what a good result looks like.
 - When a guess about a tool's flags or defaults turns out wrong, say so and fix
   it rather than defending it (this happened with a launcher flag and an editor
   default).
