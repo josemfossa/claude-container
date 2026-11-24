@@ -6,6 +6,7 @@ trap 'exit 1' INT
 BUILD=0
 RISKY=0
 SSH_AGENT_FWD=0
+ALLOWLIST=0
 IMAGE=""
 IMAGE_NAME="localhost/claude-container_claude-auth-workspace"
 
@@ -31,6 +32,9 @@ Options:
   -i, --image NAME  Use the given container image instead of building one
   --ssh-agent       Forward the host SSH agent (\$SSH_AUTH_SOCK) into the container
   --risky           Allow launching when .claude_mounts.yaml is not ignored
+  --allowlist       Mount only the paths .claudeignore lets through, one by one.
+                    The default mounts the whole directory and hides the ignored
+                    paths on top of it (see below)
 
 Files:
   .claudeignore      Patterns of files/directories to exclude from the container
@@ -38,6 +42,17 @@ Files:
   .claude_mounts.yaml  Optional compose override for extra volume mounts
   .claude_start.sh    Optional script run in the container instead of claude
                        (mounted read-only, always excluded from workspace)
+
+Mounts:
+  By default the directory is mounted as a whole, so files replaced on the host
+  (editor saves, git checkout/stash, ...) show up in the container and the other
+  way around. The ignored paths are hidden on top of it: directories with an
+  empty tmpfs, files with /dev/null. This hides what exists at launch: an ignored
+  file created later, in a directory that is visible, is not hidden.
+
+  With --allowlist every visible path is mounted on its own, so nothing new is
+  ever visible. The price is that a file replaced on the host (new inode) is
+  not seen by the container anymore until it is relaunched.
 
 Checkpointing:
   To save the current container state as an image, find the running container
@@ -52,7 +67,10 @@ Checkpointing:
 EOF
 }
 
-# Generate volume mounts from .claudeignore, computing minimal spanning set
+# What to mount or to hide, from .claudeignore. One "KIND<TAB>path" per line:
+#   M  bind mount the path (--allowlist: minimal spanning set of what is visible)
+#   D  hide the directory with an empty tmpfs (default)
+#   F  hide the file with /dev/null (default)
 generate_volume_mounts() {
   local work_dir=$1
   local claudeignore="$work_dir/.claudeignore"
@@ -72,15 +90,23 @@ generate_volume_mounts() {
     return 1
   fi
 
-  # .claude_start.sh is never part of the workspace mounts; it is mounted
-  # separately and read-only.
+  local mode=mask
+  if [[ $ALLOWLIST -eq 1 ]]; then
+    mode=allowlist
+  fi
+
+  # .claude_start.sh is mounted separately and read-only. With --allowlist it
+  # must not be part of the workspace mounts. By default it is a read-only
+  # mount on top of the whole directory, so it must not be hidden either.
   local tmp_ignore
   tmp_ignore="$(mktemp)"
   cat "$claudeignore" > "$tmp_ignore"
-  echo ".claude_start.sh" >> "$tmp_ignore"
+  if [[ $ALLOWLIST -eq 1 ]]; then
+    echo ".claude_start.sh" >> "$tmp_ignore"
+  fi
 
   local status=0
-  WORK_DIR="$work_dir" CLAUDEIGNORE="$tmp_ignore" python3 "${SCRIPT_DIR}/fd_helper.py" || status=$?
+  MODE="$mode" WORK_DIR="$work_dir" CLAUDEIGNORE="$tmp_ignore" python3 "${SCRIPT_DIR}/fd_helper.py" || status=$?
   rm -f "$tmp_ignore"
   return $status
 }
@@ -102,11 +128,26 @@ generate_compose_override() {
   override_file="$(mktemp -d)/compose.override.yml"
 
   local mounts_yaml=""
-  while IFS= read -r mount_path; do
-    if [[ -n "$mount_path" ]]; then
-      mounts_yaml+="      - \${CONTEXT}/$mount_path:/workspace/$mount_path"$'\n'
+  local tmpfs_yaml=""
+  if [[ $ALLOWLIST -eq 0 ]]; then
+    # The whole directory, the ignored paths are hidden on top of it
+    mounts_yaml+="      - \${CONTEXT}:/workspace"$'\n'
+  fi
+  while IFS=$'\t' read -r kind mount_path; do
+    if [[ -z "$mount_path" ]]; then
+      continue
     fi
+    case "$kind" in
+      M) mounts_yaml+="      - \${CONTEXT}/$mount_path:/workspace/$mount_path"$'\n' ;;
+      F) mounts_yaml+="      - /dev/null:/workspace/$mount_path:ro"$'\n' ;;
+      D) tmpfs_yaml+="      - /workspace/$mount_path"$'\n' ;;
+    esac
   done <<< "$mounts"
+
+  local tmpfs_block=""
+  if [[ -n "$tmpfs_yaml" ]]; then
+    tmpfs_block="    tmpfs:"$'\n'"${tmpfs_yaml}"
+  fi
 
   # Mount .claude_start.sh read-only and run it instead of claude
   local start_mount=""
@@ -141,17 +182,22 @@ services:
       - \${CLAUDE_CONFIG_DIR:-~}/.claude:/home/node/.claude
       - \${CLAUDE_CONFIG_DIR:-~}/.claudeconfig:/home/node/.config/anthropic/
       - \${AVEN_DB_DIR:-~/.local/state/aven/}:/home/node/.local/state/aven/
-${mounts_yaml}${ssh_mount}${start_mount}${ssh_extra}${start_command}
+${mounts_yaml}${ssh_mount}${start_mount}${tmpfs_block}${ssh_extra}${start_command}
 EOF
 
   echo "${override_file}"
 }
 
 # Return 0 if .claude_mounts.yaml would be exposed inside the container.
-# It is exposed when the whole workdir (.) or the file itself is mounted.
+# Default: it is exposed unless it is hidden. --allowlist: it is exposed when
+# the whole workdir (.) or the file itself is mounted.
 is_exposed() {
   local mounts=$1
-  grep -qxF "." <<< "$mounts" || grep -qxF ".claude_mounts.yaml" <<< "$mounts"
+  if [[ $ALLOWLIST -eq 1 ]]; then
+    awk -F'\t' '$2 == "." || $2 == ".claude_mounts.yaml" { found = 1 } END { exit !found }' <<< "$mounts"
+  else
+    ! grep -qxF $'F\t.claude_mounts.yaml' <<< "$mounts"
+  fi
 }
 
 # Generate compose override to use a specific image instead of building
@@ -185,6 +231,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ssh-agent)
       SSH_AGENT_FWD=1
+      shift
+      ;;
+    --allowlist)
+      ALLOWLIST=1
       shift
       ;;
     -i|--image)

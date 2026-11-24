@@ -6,6 +6,20 @@ from pathlib import Path
 work_dir = Path(os.environ["WORK_DIR"]).resolve()
 claudeignore = Path(os.environ["CLAUDEIGNORE"]).resolve()
 
+# Output, one "KIND<TAB>path" per line, paths relative to work_dir:
+#
+#   MODE=mask (default): the work directory is mounted whole, and these paths
+#   have to be hidden on top of it
+#     D  directory without any included file: cover it with an empty tmpfs
+#     F  ignored file in a directory that is visible: cover it with /dev/null
+#
+#   MODE=allowlist: nothing is mounted but these (minimal spanning set)
+#     M  path to bind mount
+mode = os.environ.get("MODE", "mask")
+if mode not in ("mask", "allowlist"):
+    print(f"Error: unknown MODE {mode!r}", file=sys.stderr)
+    sys.exit(1)
+
 
 def run_fd(*extra_args):
     """
@@ -140,30 +154,59 @@ for children in child_files.values():
     children.sort(key=path_sort_key)
 
 
-mounts = []
+def collect_mounts():
+    mounts = []
+
+    def collect(directory):
+        # Select the highest clean directory. Its descendants then need no
+        # individual mount entries.
+        if directory != Path(".") and is_clean_directory(directory):
+            mounts.append(directory)
+            return
+
+        # If the work directory itself is entirely clean, output ".".
+        if directory == Path(".") and is_clean_directory(directory):
+            mounts.append(directory)
+            return
+
+        for file_path in child_files.get(directory, ()):
+            mounts.append(file_path)
+
+        for child_directory in child_directories.get(directory, ()):
+            if included_count.get(child_directory, 0) > 0:
+                collect(child_directory)
+
+    collect(Path("."))
+    return [("M", path) for path in mounts]
 
 
-def collect(directory):
-    # Select the highest clean directory. Its descendants then need no
-    # individual mount entries.
-    if directory != Path(".") and is_clean_directory(directory):
-        mounts.append(directory)
-        return
+def collect_masks():
+    """
+    What to hide from a mounted work directory: the highest directories with no
+    included file (their new files are hidden too), and the ignored files left
+    in the other directories.
+    """
+    ignored_files = {}
+    for path in all_files - included_files:
+        ignored_files.setdefault(path.parent, []).append(path)
 
-    # If the work directory itself is entirely clean, output ".".
-    if directory == Path(".") and is_clean_directory(directory):
-        mounts.append(directory)
-        return
+    masks = []
 
-    for file_path in child_files.get(directory, ()):
-        mounts.append(file_path)
+    def walk(directory):
+        for child_directory in child_directories.get(directory, ()):
+            if included_count[child_directory] == 0:
+                masks.append(("D", child_directory))
+            else:
+                walk(child_directory)
 
-    for child_directory in child_directories.get(directory, ()):
-        if included_count.get(child_directory, 0) > 0:
-            collect(child_directory)
+        for file_path in ignored_files.get(directory, ()):
+            masks.append(("F", file_path))
+
+    walk(Path("."))
+    return masks
 
 
-collect(Path("."))
+entries = collect_mounts() if mode == "allowlist" else collect_masks()
 
-for path in sorted(mounts, key=path_sort_key):
-    print("." if path == Path(".") else str(path))
+for kind, path in sorted(entries, key=lambda entry: path_sort_key(entry[1])):
+    print(f"{kind}\t{'.' if path == Path('.') else path}")
